@@ -549,10 +549,16 @@ async function archive() {
 async function main() {
   console.log("[webcloner] Site: "+config.input);
   console.log("[webcloner] Folder: "+rootDir);
+  const hasCheckpoint=restore();
   const root=new URL(config.input);
   if(!(await allowed(root)))throw new Error("robots.txt disallows crawling the target URL.");
-  enqueue(config.input,0);
-  await discoverSitemaps();
+  if(!config.resume)enqueue(config.input,0);
+  if(!config.resume || !hasCheckpoint) {
+    await discoverSitemaps();
+    if(config.resume)recoverLegacyLinks();
+  }
+  // Save the pending frontier before visiting any pages.
+  persist();
   browser=await chromium.launch({headless:true,args:["--disable-dev-shm-usage"]});
   context=await browser.newContext({
     viewport:{width:1365,height:850},deviceScaleFactor:1,
@@ -560,30 +566,32 @@ async function main() {
   });
   await context.route("**/*",async route=>{
     const req=route.request();
-    // Passive GET-only browser capture. Do not trigger mutations via background POSTs.
     if(!["GET","HEAD"].includes(req.method()))return route.abort();
     const url=publicUrl(req.url());
     if(!url)return route.abort();
     return route.continue();
   });
-  let idx=0;
-  while(queue.length && pages.length<config.maxPages &&
-        assetsSaved<config.maxAssets && totalBytes<byteLimit) {
+  while(queue.length && !stopRequested &&
+        pages.length-runStartPages<config.maxPages && !budgetReached()) {
     const entry=queue.shift();
-    if(visited.has(entry.url))continue;
+    if(visited.has(entry.url) || entry.depth>config.maxDepth)continue;
+    await visit(entry,pages.length+1);
     visited.add(entry.url);
-    idx++;
-    await visit(entry,idx);
-    if(config.delayMS)await sleep(config.delayMS);
+    // Routine checkpoint plus a final one on exit/interrupt.
+    if((pages.length-runStartPages)%5===0)persist();
+    if(config.delayMS && !stopRequested)await sleep(config.delayMS);
   }
   await Promise.allSettled([...pending]);
-  await deepScan();
+  if(!stopRequested)await deepScan();
 }
-process.on("SIGINT",()=>{
-  console.log("\n[webcloner] Interrupted. Captured files remain; writing summary.");
-  persist();
-  process.exit(130);
-});
+function requestStop(signal) {
+  if(stopRequested)return;
+  stopRequested=true;
+  process.exitCode=signal==="SIGINT"?130:143;
+  console.log("\n[webcloner] "+signal+" received; saving current work and resume checkpoint.");
+}
+process.on("SIGINT",()=>requestStop("SIGINT"));
+process.on("SIGTERM",()=>requestStop("SIGTERM"));
 main().catch(err=>{
   console.error("[webcloner] ERROR:",err.message||err);
   errors.push({kind:"fatal",reason:String(err.message||err)});
