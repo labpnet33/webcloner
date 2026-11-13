@@ -76,7 +76,7 @@ const rootDir=config.out, siteDir=path.join(rootDir,"site");
 fs.mkdirSync(siteDir,{recursive:true});
 const byteLimit=config.maxTotalMB*MB, singleFileLimit=config.maxFileMB*MB;
 let totalBytes=0, assetsSaved=0, blockedRobots=0;
-let runStartPages=0,runStartAssets=0,runStartBytes=0,stopRequested=false;
+let runStartPages=0,runStartAssets=0,runStartBytes=0,stopRequested=false,canPersist=false;
 const checkpointFile=path.join(rootDir,"checkpoint.json");
 let browser=null, context=null;
 const manifest=[], pages=[], errors=[], visited=new Set(), queued=new Set();
@@ -557,6 +557,8 @@ async function main() {
     await discoverSitemaps();
     if(config.resume)recoverLegacyLinks();
   }
+  // A failure before this point must never overwrite an older capture.
+  canPersist=true;
   // Save the pending frontier before visiting any pages.
   persist();
   browser=await chromium.launch({headless:true,args:["--disable-dev-shm-usage"]});
@@ -600,6 +602,5 @@ main().catch(err=>{
   await Promise.allSettled([...pending]);
   if(context)await context.close().catch(()=>{});
   if(browser)await browser.close().catch(()=>{});
-  persist();
-  await archive();
+  if(canPersist){persist();await archive();}
 });
