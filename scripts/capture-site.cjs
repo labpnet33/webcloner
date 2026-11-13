@@ -418,19 +418,29 @@ function persist() {
     totalBytes,assetsSaved,pagesVisited:pages.length,robotsDisallowed:blockedRobots,
     assets:manifest
   };
-  fs.writeFileSync(path.join(rootDir,"manifest.json"),JSON.stringify(data,null,2));
-  fs.writeFileSync(path.join(rootDir,"pages.json"),JSON.stringify(pages,null,2));
-  fs.writeFileSync(path.join(rootDir,"errors.json"),JSON.stringify(errors.slice(0,1000),null,2));
+  // The queue is committed last: a restart never trusts a checkpoint before
+  // its corresponding manifest/pages files have been safely replaced.
+  atomicJSON(path.join(rootDir,"manifest.json"),data);
+  atomicJSON(path.join(rootDir,"pages.json"),pages);
+  atomicJSON(path.join(rootDir,"errors.json"),errors.slice(0,1000));
+  atomicJSON(checkpointFile,{
+    version:1,source:config.input,updatedAt:new Date().toISOString(),
+    visited:[...visited],queue,discoveredAssets:[...discoveredAssets],
+    pagesVisited:pages.length,resourcesSaved:assetsSaved
+  });
   const summary=[
     "Webcloner public website capture",
     "==============================",
     "Requested URL: "+config.input,
-    "Pages visited: "+pages.length,
-    "Resources saved: "+assetsSaved,
-    "Bytes saved: "+(totalBytes/MB).toFixed(2)+" MiB",
-    "Robots exclusions: "+blockedRobots,
+    "Pages visited (total): "+pages.length,
+    "Pages visited (this run): "+(pages.length-runStartPages),
+    "Remaining queued pages: "+queue.length,
+    "Resources saved (total): "+assetsSaved,
+    "Bytes saved (total): "+(totalBytes/MB).toFixed(2)+" MiB",
+    "Robots exclusions (this run): "+blockedRobots,
     "Page/asset errors: "+errors.length,
     "Output: "+rootDir,
+    "Resume: use the same --out directory with --resume.",
     "",
     "Limitations:",
     "- Public HTTP pages and browser-loaded resources only.",
@@ -442,6 +452,91 @@ function persist() {
   ].join("\n")+"\n";
   fs.writeFileSync(path.join(rootDir,"report.txt"),summary);
   console.log("\n"+summary);
+}
+function restore() {
+  const manifestPath=path.join(rootDir,"manifest.json");
+  const pagesPath=path.join(rootDir,"pages.json");
+  if(!config.resume) {
+    if(fs.existsSync(manifestPath) || fs.existsSync(checkpointFile))
+      throw new Error("Existing capture detected. Add --resume or use a new --out folder.");
+    return false;
+  }
+  if(!fs.existsSync(manifestPath) || !fs.existsSync(pagesPath))
+    throw new Error("--resume needs an existing manifest.json and pages.json in --out.");
+  const prior=JSON.parse(fs.readFileSync(manifestPath,"utf8"));
+  if(new URL(prior.source).href!==new URL(config.input).href)
+    throw new Error("Resume source differs from existing capture: "+prior.source);
+  if(!Array.isArray(prior.assets))throw new Error("Invalid manifest: assets array missing");
+  const oldPages=JSON.parse(fs.readFileSync(pagesPath,"utf8"));
+  if(!Array.isArray(oldPages))throw new Error("Invalid pages.json");
+  // Reconstruct deduplication and budgets from files on disk, not only counters.
+  for(const entry of prior.assets) {
+    if(!entry || typeof entry.url!=="string" || typeof entry.local!=="string")continue;
+    const file=path.resolve(rootDir,entry.local);
+    if(!file.startsWith(rootDir+path.sep) || !fs.existsSync(file))continue;
+    const stat=fs.statSync(file);
+    if(!stat.isFile())continue;
+    manifest.push(entry);
+    savedUrls.add(entry.url);
+    fileOwners.set(entry.local,entry.url);
+    totalBytes+=stat.size;
+    assetsSaved++;
+  }
+  for(const page of oldPages) {
+    if(!page || typeof page.url!=="string")continue;
+    pages.push(page);
+    visited.add(page.url);
+  }
+  const hasCheckpoint=fs.existsSync(checkpointFile);
+  if(hasCheckpoint) {
+    const state=JSON.parse(fs.readFileSync(checkpointFile,"utf8"));
+    if(state.version!==1 || new URL(state.source).href!==new URL(config.input).href)
+      throw new Error("Checkpoint version or target URL mismatch.");
+    for(const raw of state.visited||[]) {
+      const u=publicUrl(raw);if(u && isPage(u))visited.add(u.href);
+    }
+    for(const item of state.queue||[]) {
+      if(!item || !Number.isInteger(item.depth) || item.depth<0 || item.depth>8)continue;
+      const u=publicUrl(item.url);
+      if(u && isPage(u) && !visited.has(u.href) && !queued.has(u.href)) {
+        queued.add(u.href);queue.push({url:u.href,depth:item.depth});
+      }
+    }
+    for(const raw of state.discoveredAssets||[]) {
+      const u=publicUrl(raw);if(u && withinSite(u))discoveredAssets.add(u.href);
+    }
+    console.log("[webcloner] Restored pending URL queue:",queue.length);
+  } else console.log("[webcloner] Older capture found; will recover links from saved HTML and sitemaps.");
+  runStartPages=pages.length;
+  runStartAssets=assetsSaved;
+  runStartBytes=totalBytes;
+  console.log("[webcloner] Loaded",pages.length,"previous pages and",assetsSaved,"existing resources.");
+  return hasCheckpoint;
+}
+function recoverLegacyLinks() {
+  const depths=new Map();
+  for(const page of pages) {
+    const depth=Number.isInteger(page.depth)?page.depth:0;
+    depths.set(page.url,depth);
+    if(page.finalUrl)depths.set(page.finalUrl,depth);
+  }
+  let scanned=0;
+  for(const entry of manifest) {
+    if(entry.via!=="hydrated-dom" || !/html/i.test(entry.type||""))continue;
+    const src=publicUrl(entry.url),file=path.resolve(rootDir,entry.local);
+    if(!src || !withinSite(src) || !file.startsWith(rootDir+path.sep))continue;
+    try {
+      if(fs.statSync(file).size>8*MB)continue;
+      const html=fs.readFileSync(file,"utf8");
+      const links=/<a\b[^>]*\bhref\s*=\s*(["'])(.*?)\1/gi;
+      const depth=(depths.get(src.href)??0)+1;
+      for(const match of html.matchAll(links)) {
+        try{enqueue(match[2].replace(/&amp;/g,"&"),depth,src.href);}catch{}
+      }
+      scanned++;
+    } catch{}
+  }
+  console.log("[webcloner] Recovered links from",scanned,"saved HTML snapshots; pending:",queue.length);
 }
 async function archive() {
   const destination=rootDir+".zip",basename=path.basename(rootDir);
