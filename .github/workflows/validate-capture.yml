@@ -21,8 +21,14 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Validate Bash syntax
-        run: bash -n scripts/capture-site.sh
+        run: |
+          bash -n scripts/capture-site.sh
+          bash -n scripts/capture-extra.sh
+          bash -n scripts/capture-all.sh
       - name: Validate Node syntax
         run: node --check scripts/capture-site.cjs
       - name: Verify help entrypoint works without installing dependencies
-        run: bash scripts/capture-site.sh --help
+        run: |
+          bash scripts/capture-site.sh --help
+          bash scripts/capture-extra.sh --help
+          bash scripts/capture-all.sh --help
