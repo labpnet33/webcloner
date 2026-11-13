@@ -27,6 +27,8 @@ jobs:
           bash -n scripts/capture-all.sh
       - name: Validate Node syntax
         run: node --check scripts/capture-site.cjs
+      - name: Verify resume behavior with mock browser and HTTP
+        run: node --test scripts/tests/resume.test.cjs
       - name: Verify help entrypoint works without installing dependencies
         run: |
           bash scripts/capture-site.sh --help
