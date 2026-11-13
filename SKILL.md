@@ -64,6 +64,30 @@ Collect only what is necessary: target URL/repo, permission to use original asse
 - Maintain `templates/feature-matrix.csv`. Inspect the *real behavior* of every user-facing button; a visible UI is not a working feature.
 - Check all legal and policy pages, links, SEO metadata, favicon/PWA icons, brand references, asset licensing, and analytics identifiers.
 
+### Use all three public capture engines when extra coverage is requested
+
+When the user asks to download as much publicly available website data as
+practical, prefer the combined launcher over Playwright alone:
+
+    git clone https://github.com/labpnet33/webcloner.git
+    cd webcloner
+    bash scripts/capture-all.sh https://example.com
+
+The combined launcher runs:
+1. Playwright for hydrated public pages, browser-fetched JS/CSS/WASM and assets;
+2. GNU Wget for linked public files and converted offline HTML links;
+3. Browsertrix for browser-based WARC/WACZ replay archives (Docker required).
+
+For a bounded, authorized deeper capture:
+
+    bash scripts/capture-all.sh https://example.com \
+      --pages 80 --depth 4 --quota-mb 1200 --max-minutes 30
+
+Do not represent WARC/WACZ as source code. Respect robots.txt and terms,
+never circumvent access controls or paid features, and be explicit about which
+engines actually completed. Script options and setup are in README.md.
+When only Playwright is available, scripts/capture-site.sh remains supported.
+
 ### Reusable Linux public capture command (scripts in this repository)
 
 When the user wants to **download public website pages and assets** from Linux, use the checked-in tool:
