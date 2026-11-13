@@ -37,7 +37,7 @@ function parseArgs(argv) {
     input: input.href, host: input.hostname.toLowerCase(), out: null,
     maxPages:40, maxDepth:3, maxAssets:2500, maxTotalMB:800,
     maxFileMB:35, delayMS:700, subdomains:false, thirdParty:false,
-    deepAssets:true, sitemap:true, screenshots:true
+    deepAssets:true, sitemap:true, screenshots:true, resume:false
   };
   const values = {
     "--out":["out",null,null], "--max-pages":["maxPages",1,500],
@@ -50,7 +50,8 @@ function parseArgs(argv) {
     "--third-party-assets":["thirdParty",true],
     "--no-deep-assets":["deepAssets",false],
     "--no-sitemap":["sitemap",false],
-    "--no-screenshots":["screenshots",false]
+    "--no-screenshots":["screenshots",false],
+    "--resume":["resume",true]
   };
   for (let i=1; i<argv.length; i++) {
     const flag = argv[i];
@@ -61,6 +62,7 @@ function parseArgs(argv) {
       config[name]=name==="out"?path.resolve(raw):bounded(raw,flag,min,max);
     } else throw new Error("Unknown argument: " + flag);
   }
+  if(config.resume && !config.out)throw new Error("--resume requires --out with the existing capture folder.");
   if (!config.out) {
     const stamp=new Date().toISOString().replace(/[:.]/g,"-");
     config.out=path.resolve("captures",config.host.replace(/[^a-z0-9.-]/gi,"_")+"-"+stamp);
@@ -74,11 +76,21 @@ const rootDir=config.out, siteDir=path.join(rootDir,"site");
 fs.mkdirSync(siteDir,{recursive:true});
 const byteLimit=config.maxTotalMB*MB, singleFileLimit=config.maxFileMB*MB;
 let totalBytes=0, assetsSaved=0, blockedRobots=0;
+let runStartPages=0,runStartAssets=0,runStartBytes=0,stopRequested=false;
+const checkpointFile=path.join(rootDir,"checkpoint.json");
 let browser=null, context=null;
 const manifest=[], pages=[], errors=[], visited=new Set(), queued=new Set();
 const queue=[], savedUrls=new Set(), recording=new Set(), pending=new Set();
 const fileOwners=new Map(), discoveredAssets=new Set(), robotRules=new Map();
 const baseHost=config.host.replace(/^www\./,"");
+const runAssets=()=>assetsSaved-runStartAssets;
+const runBytes=()=>totalBytes-runStartBytes;
+const budgetReached=()=>runAssets()>=config.maxAssets || runBytes()>=byteLimit;
+function atomicJSON(file,value) {
+  const temp=file+".tmp-"+process.pid;
+  fs.writeFileSync(temp,JSON.stringify(value,null,2));
+  fs.renameSync(temp,file);
+}
 const robotsUrlOf=u=>u.protocol+"//"+u.host+"/robots.txt";
 
 function withinSite(u) {
@@ -156,7 +168,7 @@ function writeFile(full,body) {
 }
 function makeEntry(url,body,mime,status,via,isDocument=false) {
   if (savedUrls.has(url) || recording.has(url))return false;
-  if (assetsSaved>=config.maxAssets || totalBytes+body.length>byteLimit || body.length>singleFileLimit)return false;
+  if (runAssets()>=config.maxAssets || runBytes()+body.length>byteLimit || body.length>singleFileLimit)return false;
   const file=outputPath(url,mime,isDocument);
   let rel=file.rel,full=file.full;
   if (fileOwners.has(rel) && fileOwners.get(rel)!==url) {
@@ -207,9 +219,9 @@ async function record(response) {
       MEDIA_TYPE.test(mime);
     if (!same && (!config.thirdParty || !staticResource))return;
     if (savedUrls.has(actual.href) || recording.has(actual.href))return;
-    if (assetsSaved>=config.maxAssets || totalBytes>=byteLimit)return;
+    if (budgetReached())return;
     const len=Number(response.headers()["content-length"]||0);
-    if (len>singleFileLimit || (len && len+totalBytes>byteLimit))return;
+    if (len>singleFileLimit || (len && len+runBytes()>byteLimit))return;
     if (!(await allowed(actual)))return;
     recording.add(actual.href);
     try {
@@ -293,7 +305,7 @@ async function downloadDiscovered(url) {
       await resp.body?.cancel();return;
     }
     const length=Number(resp.headers.get("content-length")||0);
-    if (length>singleFileLimit || length+totalBytes>byteLimit) {
+    if (length>singleFileLimit || length+runBytes()>byteLimit) {
       await resp.body?.cancel();return;
     }
     const chunks=[];let lengthRead=0;
@@ -303,7 +315,7 @@ async function downloadDiscovered(url) {
       const {value,done}=await reader.read();
       if(done)break;
       lengthRead+=value.length;
-      if (lengthRead>singleFileLimit || lengthRead+totalBytes>byteLimit) {
+      if (lengthRead>singleFileLimit || lengthRead+runBytes()>byteLimit) {
         await reader.cancel();return;
       }
       chunks.push(Buffer.from(value));
@@ -317,7 +329,7 @@ async function visit(entry,index) {
   const {url,depth}=entry;
   const u=publicUrl(url);
   if(!u||!isPage(u)||!(await allowed(u)))return;
-  console.log("[webcloner] Page "+index+"/"+config.maxPages+" depth "+depth+": "+u.href);
+  console.log("[webcloner] Page "+index+" (batch "+(index-runStartPages)+"/"+config.maxPages+") depth "+depth+": "+u.href);
   const page=await context.newPage();
   page.on("response",scheduleResponse);
   page.on("pageerror",err=>{
@@ -392,7 +404,7 @@ async function deepScan() {
   console.log("[webcloner] Additional public static asset candidates: "+candidates.length);
   let done=0;
   for(const u of candidates){
-    if(assetsSaved>=config.maxAssets || totalBytes>=byteLimit)break;
+    if(stopRequested || budgetReached())break;
     if(done++>config.maxAssets)break;
     await downloadDiscovered(u);
     if(done%20===0)await sleep(Math.max(100,config.delayMS));
