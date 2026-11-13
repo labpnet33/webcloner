@@ -88,6 +88,30 @@ original server code. Each tool has different coverage and none circumvents
 authentication, licensing, paywalls, robots.txt or site restrictions. Only
 capture/republish content you have permission to use.
 
+## Resume an interrupted or 500-page-limited capture
+
+Webcloner now supports **`--resume`**. Use the **exact same `--out` directory and starting URL** as the original run. The 500-page limit applies **per run**, not to the lifetime of the capture. Each run can discover up to another 500 pages, without downloading existing files again.
+
+Example: from your BallEngine working directory:
+
+```bash
+cd ~/ballengine
+bash ~/webcloner/scripts/capture-all.sh https://ballengine.app/ \
+  --out "$HOME/ballengine/captures/full-site" \
+  --pages 500 --depth 8 --quota-mb 5000 --max-minutes 120 \
+  --resume
+```
+
+A resumed combined run continues **Playwright only**, preserving already completed Wget and Browsertrix files. New public HTML, scripts, fonts, media and assets append to the existing Playwright capture. Previous runs' `manifest.json`, `pages.json`, and saved resources are retained.
+
+After each batch, view `captures/full-site/playwright/report.txt`. It shows the cumulative pages visited and **Remaining queued pages**. Repeat the same command while pending pages remain.
+
+- New captures write an atomic `playwright/checkpoint.json` containing visited URLs and the remaining crawl queue. The checkpoint is refreshed every five pages, and on normal stop or Ctrl+C.
+- Older captures with `manifest.json` and `pages.json` but no checkpoint can also resume: Webcloner recovers links from the saved HTML and the public sitemap. **This is best effort**, because the older version never saved its pending queue.
+- `--pages`, `--quota-mb` and the asset count are **per-run budgets**. The report records cumulative totals. Use the same or greater `--depth` to preserve page coverage.
+- Resume requires `--out`; a new timestamped folder would start a new crawl. If the URL differs from the original capture, Webcloner refuses to resume.
+- The site must still be publicly accessible and within robots.txt rules. Resume does not access login-only content or unlinked/unavailable URLs. Do not edit or delete the captured files while a crawl is running.
+
 ## Output files
 
 | File or directory | Content |
