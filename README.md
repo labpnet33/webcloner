@@ -45,6 +45,49 @@ Specify your destination folder if desired:
 
     ./scripts/capture-site.sh https://example.com --out "$HOME/example-capture"
 
+## Three-engine public capture: Playwright + Wget + Browsertrix
+
+The new combined command runs all three complementary capture engines:
+
+    bash scripts/capture-all.sh https://example.com
+
+For a deeper authorized audit:
+
+    bash scripts/capture-all.sh https://example.com \
+      --pages 80 --depth 4 --quota-mb 1200 --max-minutes 30
+
+The command asks for the URL if started interactively without arguments.
+It produces one capture directory with:
+
+- playwright/ — browser-loaded assets, HTML, screenshots, a manifest and logs
+- extra/wget/ — linked public HTML/CSS and rewritten links for offline browsing
+- extra/browsertrix/ — public WARC/WACZ archive for replay at replayweb.page
+- extra/extra-capture-report.txt — per-engine results
+- all-engines-report.txt — overall result and any missing dependencies
+
+Install optional dependencies on Ubuntu:
+
+    sudo apt-get update
+    sudo apt-get install -y wget zip git
+    # Install Docker Engine for Browsertrix using Docker's official Ubuntu instructions.
+    docker info
+
+The Playwright script uses Node.js 20+ and automatically installs its own
+Playwright package and Chromium browser. Browsertrix runs from the
+webrecorder/browsertrix-crawler Docker image and explicitly respects robots.txt.
+If Docker or Wget is not installed, the combined runner reports the missing
+engine, and other engines can still produce useful output.
+
+To run one additional engine independently:
+
+    bash scripts/capture-extra.sh https://example.com --engine wget
+    bash scripts/capture-extra.sh https://example.com --engine browsertrix
+
+**Not an automatic exact clone.** Browsertrix captures a replay archive, not the
+original server code. Each tool has different coverage and none circumvents
+authentication, licensing, paywalls, robots.txt or site restrictions. Only
+capture/republish content you have permission to use.
+
 ## Output files
 
 | File or directory | Content |
