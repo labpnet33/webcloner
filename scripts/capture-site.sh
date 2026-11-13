@@ -13,6 +13,7 @@ Usage:
 
 Options:
   --out DIR               Destination directory (default captures/HOST-TIMESTAMP)
+  --resume                Continue an existing --out; each run visits up to --max-pages NEW pages
   --max-pages N           Public pages to visit (default 40, maximum 500)
   --max-depth N           Link-following depth (default 3, maximum 8)
   --max-assets N          Maximum saved assets (default 2500, maximum 20000)
@@ -32,6 +33,7 @@ Output:
   DIR/manifest.json       Public URL to saved-file mapping
   DIR/pages.json          Page crawl details
   DIR/report.txt          Summary and limitations
+  DIR/checkpoint.json      Saved URL queue and completed-page checkpoint
   DIR.zip                 Archive if the zip utility is available
 
 PUBLIC capture only: no private source, credentials, locked account data,
