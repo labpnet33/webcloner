@@ -64,6 +64,33 @@ Collect only what is necessary: target URL/repo, permission to use original asse
 - Maintain `templates/feature-matrix.csv`. Inspect the *real behavior* of every user-facing button; a visible UI is not a working feature.
 - Check all legal and policy pages, links, SEO metadata, favicon/PWA icons, brand references, asset licensing, and analytics identifiers.
 
+### Reusable Linux public capture command (scripts in this repository)
+
+When the user wants to **download public website pages and assets** from Linux, use the checked-in tool:
+
+    git clone https://github.com/labpnet33/webcloner.git
+    cd webcloner
+    chmod +x scripts/capture-site.sh
+    ./scripts/capture-site.sh https://example.com
+
+When no URL was supplied, ask for the URL first, then substitute it in the command.
+The Bash script also prompts for a URL when launched interactively.
+
+For an authorized deeper crawl, explain resource and rate limits and optionally use:
+
+    ./scripts/capture-site.sh https://example.com \
+      --max-pages 100 --max-depth 5 --max-assets 8000 \
+      --max-total-mb 1500 --max-file-mb 100
+
+**Respect robots.txt and site terms.** The crawler only visits publicly reachable pages, records browser-loaded files, and may discover additional static assets in JS/CSS. It does not log in, circumvent private/paid functionality, bypass defenses, or obtain proprietary backend source code. The files under captures/ include a manifest, page list, error log, and optional ZIP; this is a starting point for an independent rebuild, not a guarantee of a functioning copy.
+
+For a user who has already cloned the repository on Ubuntu and asks how to receive future skill/script changes, provide:
+
+    cd ~/webcloner
+    git pull --ff-only origin main
+
+Do not automatically push captured third-party content to a public GitHub repository, and do not imply that downloading files grants publication rights.
+
 ### Phase 2 — Capture or rebuild
 
 **Preferred: source migration.** Clone the authorized repository; install dependencies, run official build, create reproducible development commands, and preserve licenses.
