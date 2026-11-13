@@ -37,7 +37,7 @@ function parseArgs(argv) {
     input: input.href, host: input.hostname.toLowerCase(), out: null,
     maxPages:40, maxDepth:3, maxAssets:2500, maxTotalMB:800,
     maxFileMB:35, delayMS:700, subdomains:false, thirdParty:false,
-    deepAssets:true, sitemap:true, screenshots:true
+    deepAssets:true, sitemap:true, screenshots:true, resume:false
   };
   const values = {
     "--out":["out",null,null], "--max-pages":["maxPages",1,500],
@@ -50,7 +50,8 @@ function parseArgs(argv) {
     "--third-party-assets":["thirdParty",true],
     "--no-deep-assets":["deepAssets",false],
     "--no-sitemap":["sitemap",false],
-    "--no-screenshots":["screenshots",false]
+    "--no-screenshots":["screenshots",false],
+    "--resume":["resume",true]
   };
   for (let i=1; i<argv.length; i++) {
     const flag = argv[i];
@@ -61,6 +62,7 @@ function parseArgs(argv) {
       config[name]=name==="out"?path.resolve(raw):bounded(raw,flag,min,max);
     } else throw new Error("Unknown argument: " + flag);
   }
+  if(config.resume && !config.out)throw new Error("--resume requires --out with the existing capture folder.");
   if (!config.out) {
     const stamp=new Date().toISOString().replace(/[:.]/g,"-");
     config.out=path.resolve("captures",config.host.replace(/[^a-z0-9.-]/gi,"_")+"-"+stamp);
@@ -74,11 +76,21 @@ const rootDir=config.out, siteDir=path.join(rootDir,"site");
 fs.mkdirSync(siteDir,{recursive:true});
 const byteLimit=config.maxTotalMB*MB, singleFileLimit=config.maxFileMB*MB;
 let totalBytes=0, assetsSaved=0, blockedRobots=0;
+let runStartPages=0,runStartAssets=0,runStartBytes=0,stopRequested=false,canPersist=false;
+const checkpointFile=path.join(rootDir,"checkpoint.json");
 let browser=null, context=null;
 const manifest=[], pages=[], errors=[], visited=new Set(), queued=new Set();
 const queue=[], savedUrls=new Set(), recording=new Set(), pending=new Set();
 const fileOwners=new Map(), discoveredAssets=new Set(), robotRules=new Map();
 const baseHost=config.host.replace(/^www\./,"");
+const runAssets=()=>assetsSaved-runStartAssets;
+const runBytes=()=>totalBytes-runStartBytes;
+const budgetReached=()=>runAssets()>=config.maxAssets || runBytes()>=byteLimit;
+function atomicJSON(file,value) {
+  const temp=file+".tmp-"+process.pid;
+  fs.writeFileSync(temp,JSON.stringify(value,null,2));
+  fs.renameSync(temp,file);
+}
 const robotsUrlOf=u=>u.protocol+"//"+u.host+"/robots.txt";
 
 function withinSite(u) {
@@ -156,7 +168,7 @@ function writeFile(full,body) {
 }
 function makeEntry(url,body,mime,status,via,isDocument=false) {
   if (savedUrls.has(url) || recording.has(url))return false;
-  if (assetsSaved>=config.maxAssets || totalBytes+body.length>byteLimit || body.length>singleFileLimit)return false;
+  if (runAssets()>=config.maxAssets || runBytes()+body.length>byteLimit || body.length>singleFileLimit)return false;
   const file=outputPath(url,mime,isDocument);
   let rel=file.rel,full=file.full;
   if (fileOwners.has(rel) && fileOwners.get(rel)!==url) {
@@ -207,9 +219,9 @@ async function record(response) {
       MEDIA_TYPE.test(mime);
     if (!same && (!config.thirdParty || !staticResource))return;
     if (savedUrls.has(actual.href) || recording.has(actual.href))return;
-    if (assetsSaved>=config.maxAssets || totalBytes>=byteLimit)return;
+    if (budgetReached())return;
     const len=Number(response.headers()["content-length"]||0);
-    if (len>singleFileLimit || (len && len+totalBytes>byteLimit))return;
+    if (len>singleFileLimit || (len && len+runBytes()>byteLimit))return;
     if (!(await allowed(actual)))return;
     recording.add(actual.href);
     try {
@@ -293,7 +305,7 @@ async function downloadDiscovered(url) {
       await resp.body?.cancel();return;
     }
     const length=Number(resp.headers.get("content-length")||0);
-    if (length>singleFileLimit || length+totalBytes>byteLimit) {
+    if (length>singleFileLimit || length+runBytes()>byteLimit) {
       await resp.body?.cancel();return;
     }
     const chunks=[];let lengthRead=0;
@@ -303,7 +315,7 @@ async function downloadDiscovered(url) {
       const {value,done}=await reader.read();
       if(done)break;
       lengthRead+=value.length;
-      if (lengthRead>singleFileLimit || lengthRead+totalBytes>byteLimit) {
+      if (lengthRead>singleFileLimit || lengthRead+runBytes()>byteLimit) {
         await reader.cancel();return;
       }
       chunks.push(Buffer.from(value));
@@ -317,7 +329,7 @@ async function visit(entry,index) {
   const {url,depth}=entry;
   const u=publicUrl(url);
   if(!u||!isPage(u)||!(await allowed(u)))return;
-  console.log("[webcloner] Page "+index+"/"+config.maxPages+" depth "+depth+": "+u.href);
+  console.log("[webcloner] Page "+index+" (batch "+(index-runStartPages)+"/"+config.maxPages+") depth "+depth+": "+u.href);
   const page=await context.newPage();
   page.on("response",scheduleResponse);
   page.on("pageerror",err=>{
@@ -392,7 +404,7 @@ async function deepScan() {
   console.log("[webcloner] Additional public static asset candidates: "+candidates.length);
   let done=0;
   for(const u of candidates){
-    if(assetsSaved>=config.maxAssets || totalBytes>=byteLimit)break;
+    if(stopRequested || budgetReached())break;
     if(done++>config.maxAssets)break;
     await downloadDiscovered(u);
     if(done%20===0)await sleep(Math.max(100,config.delayMS));
@@ -406,19 +418,29 @@ function persist() {
     totalBytes,assetsSaved,pagesVisited:pages.length,robotsDisallowed:blockedRobots,
     assets:manifest
   };
-  fs.writeFileSync(path.join(rootDir,"manifest.json"),JSON.stringify(data,null,2));
-  fs.writeFileSync(path.join(rootDir,"pages.json"),JSON.stringify(pages,null,2));
-  fs.writeFileSync(path.join(rootDir,"errors.json"),JSON.stringify(errors.slice(0,1000),null,2));
+  // The queue is committed last: a restart never trusts a checkpoint before
+  // its corresponding manifest/pages files have been safely replaced.
+  atomicJSON(path.join(rootDir,"manifest.json"),data);
+  atomicJSON(path.join(rootDir,"pages.json"),pages);
+  atomicJSON(path.join(rootDir,"errors.json"),errors.slice(0,1000));
+  atomicJSON(checkpointFile,{
+    version:1,source:config.input,updatedAt:new Date().toISOString(),
+    visited:[...visited],queue,discoveredAssets:[...discoveredAssets],
+    pagesVisited:pages.length,resourcesSaved:assetsSaved
+  });
   const summary=[
     "Webcloner public website capture",
     "==============================",
     "Requested URL: "+config.input,
-    "Pages visited: "+pages.length,
-    "Resources saved: "+assetsSaved,
-    "Bytes saved: "+(totalBytes/MB).toFixed(2)+" MiB",
-    "Robots exclusions: "+blockedRobots,
+    "Pages visited (total): "+pages.length,
+    "Pages visited (this run): "+(pages.length-runStartPages),
+    "Remaining queued pages: "+queue.length,
+    "Resources saved (total): "+assetsSaved,
+    "Bytes saved (total): "+(totalBytes/MB).toFixed(2)+" MiB",
+    "Robots exclusions (this run): "+blockedRobots,
     "Page/asset errors: "+errors.length,
     "Output: "+rootDir,
+    "Resume: use the same --out directory with --resume.",
     "",
     "Limitations:",
     "- Public HTTP pages and browser-loaded resources only.",
@@ -431,6 +453,91 @@ function persist() {
   fs.writeFileSync(path.join(rootDir,"report.txt"),summary);
   console.log("\n"+summary);
 }
+function restore() {
+  const manifestPath=path.join(rootDir,"manifest.json");
+  const pagesPath=path.join(rootDir,"pages.json");
+  if(!config.resume) {
+    if(fs.existsSync(manifestPath) || fs.existsSync(checkpointFile))
+      throw new Error("Existing capture detected. Add --resume or use a new --out folder.");
+    return false;
+  }
+  if(!fs.existsSync(manifestPath) || !fs.existsSync(pagesPath))
+    throw new Error("--resume needs an existing manifest.json and pages.json in --out.");
+  const prior=JSON.parse(fs.readFileSync(manifestPath,"utf8"));
+  if(new URL(prior.source).href!==new URL(config.input).href)
+    throw new Error("Resume source differs from existing capture: "+prior.source);
+  if(!Array.isArray(prior.assets))throw new Error("Invalid manifest: assets array missing");
+  const oldPages=JSON.parse(fs.readFileSync(pagesPath,"utf8"));
+  if(!Array.isArray(oldPages))throw new Error("Invalid pages.json");
+  // Reconstruct deduplication and budgets from files on disk, not only counters.
+  for(const entry of prior.assets) {
+    if(!entry || typeof entry.url!=="string" || typeof entry.local!=="string")continue;
+    const file=path.resolve(rootDir,entry.local);
+    if(!file.startsWith(rootDir+path.sep) || !fs.existsSync(file))continue;
+    const stat=fs.statSync(file);
+    if(!stat.isFile())continue;
+    manifest.push(entry);
+    savedUrls.add(entry.url);
+    fileOwners.set(entry.local,entry.url);
+    totalBytes+=stat.size;
+    assetsSaved++;
+  }
+  for(const page of oldPages) {
+    if(!page || typeof page.url!=="string")continue;
+    pages.push(page);
+    visited.add(page.url);
+  }
+  const hasCheckpoint=fs.existsSync(checkpointFile);
+  if(hasCheckpoint) {
+    const state=JSON.parse(fs.readFileSync(checkpointFile,"utf8"));
+    if(state.version!==1 || new URL(state.source).href!==new URL(config.input).href)
+      throw new Error("Checkpoint version or target URL mismatch.");
+    for(const raw of state.visited||[]) {
+      const u=publicUrl(raw);if(u && isPage(u))visited.add(u.href);
+    }
+    for(const item of state.queue||[]) {
+      if(!item || !Number.isInteger(item.depth) || item.depth<0 || item.depth>8)continue;
+      const u=publicUrl(item.url);
+      if(u && isPage(u) && !visited.has(u.href) && !queued.has(u.href)) {
+        queued.add(u.href);queue.push({url:u.href,depth:item.depth});
+      }
+    }
+    for(const raw of state.discoveredAssets||[]) {
+      const u=publicUrl(raw);if(u && withinSite(u))discoveredAssets.add(u.href);
+    }
+    console.log("[webcloner] Restored pending URL queue:",queue.length);
+  } else console.log("[webcloner] Older capture found; will recover links from saved HTML and sitemaps.");
+  runStartPages=pages.length;
+  runStartAssets=assetsSaved;
+  runStartBytes=totalBytes;
+  console.log("[webcloner] Loaded",pages.length,"previous pages and",assetsSaved,"existing resources.");
+  return hasCheckpoint;
+}
+function recoverLegacyLinks() {
+  const depths=new Map();
+  for(const page of pages) {
+    const depth=Number.isInteger(page.depth)?page.depth:0;
+    depths.set(page.url,depth);
+    if(page.finalUrl)depths.set(page.finalUrl,depth);
+  }
+  let scanned=0;
+  for(const entry of manifest) {
+    if(entry.via!=="hydrated-dom" || !/html/i.test(entry.type||""))continue;
+    const src=publicUrl(entry.url),file=path.resolve(rootDir,entry.local);
+    if(!src || !withinSite(src) || !file.startsWith(rootDir+path.sep))continue;
+    try {
+      if(fs.statSync(file).size>8*MB)continue;
+      const html=fs.readFileSync(file,"utf8");
+      const links=/<a\b[^>]*\bhref\s*=\s*(["'])(.*?)\1/gi;
+      const depth=(depths.get(src.href)??0)+1;
+      for(const match of html.matchAll(links)) {
+        try{enqueue(match[2].replace(/&amp;/g,"&"),depth,src.href);}catch{}
+      }
+      scanned++;
+    } catch{}
+  }
+  console.log("[webcloner] Recovered links from",scanned,"saved HTML snapshots; pending:",queue.length);
+}
 async function archive() {
   const destination=rootDir+".zip",basename=path.basename(rootDir);
   const res=spawnSync("zip",["-q","-r",destination,basename],{
@@ -442,10 +549,18 @@ async function archive() {
 async function main() {
   console.log("[webcloner] Site: "+config.input);
   console.log("[webcloner] Folder: "+rootDir);
+  const hasCheckpoint=restore();
   const root=new URL(config.input);
   if(!(await allowed(root)))throw new Error("robots.txt disallows crawling the target URL.");
-  enqueue(config.input,0);
-  await discoverSitemaps();
+  if(!config.resume)enqueue(config.input,0);
+  if(!config.resume || !hasCheckpoint) {
+    await discoverSitemaps();
+    if(config.resume)recoverLegacyLinks();
+  }
+  // A failure before this point must never overwrite an older capture.
+  canPersist=true;
+  // Save the pending frontier before visiting any pages.
+  persist();
   browser=await chromium.launch({headless:true,args:["--disable-dev-shm-usage"]});
   context=await browser.newContext({
     viewport:{width:1365,height:850},deviceScaleFactor:1,
@@ -453,30 +568,32 @@ async function main() {
   });
   await context.route("**/*",async route=>{
     const req=route.request();
-    // Passive GET-only browser capture. Do not trigger mutations via background POSTs.
     if(!["GET","HEAD"].includes(req.method()))return route.abort();
     const url=publicUrl(req.url());
     if(!url)return route.abort();
     return route.continue();
   });
-  let idx=0;
-  while(queue.length && pages.length<config.maxPages &&
-        assetsSaved<config.maxAssets && totalBytes<byteLimit) {
+  while(queue.length && !stopRequested &&
+        pages.length-runStartPages<config.maxPages && !budgetReached()) {
     const entry=queue.shift();
-    if(visited.has(entry.url))continue;
+    if(visited.has(entry.url) || entry.depth>config.maxDepth)continue;
+    await visit(entry,pages.length+1);
     visited.add(entry.url);
-    idx++;
-    await visit(entry,idx);
-    if(config.delayMS)await sleep(config.delayMS);
+    // Routine checkpoint plus a final one on exit/interrupt.
+    if((pages.length-runStartPages)%5===0)persist();
+    if(config.delayMS && !stopRequested)await sleep(config.delayMS);
   }
   await Promise.allSettled([...pending]);
-  await deepScan();
+  if(!stopRequested)await deepScan();
 }
-process.on("SIGINT",()=>{
-  console.log("\n[webcloner] Interrupted. Captured files remain; writing summary.");
-  persist();
-  process.exit(130);
-});
+function requestStop(signal) {
+  if(stopRequested)return;
+  stopRequested=true;
+  process.exitCode=signal==="SIGINT"?130:143;
+  console.log("\n[webcloner] "+signal+" received; saving current work and resume checkpoint.");
+}
+process.on("SIGINT",()=>requestStop("SIGINT"));
+process.on("SIGTERM",()=>requestStop("SIGTERM"));
 main().catch(err=>{
   console.error("[webcloner] ERROR:",err.message||err);
   errors.push({kind:"fatal",reason:String(err.message||err)});
@@ -485,6 +602,5 @@ main().catch(err=>{
   await Promise.allSettled([...pending]);
   if(context)await context.close().catch(()=>{});
   if(browser)await browser.close().catch(()=>{});
-  persist();
-  await archive();
+  if(canPersist){persist();await archive();}
 });
